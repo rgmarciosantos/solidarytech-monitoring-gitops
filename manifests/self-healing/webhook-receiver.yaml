@@ -1,0 +1,274 @@
+# =============================================================================
+# Self-Healing Webhook Receiver
+# Roda dentro do cluster, recebe webhooks do Alertmanager e executa
+# =============================================================================
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: self-healing-script
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: self-healing
+    app.kubernetes.io/part-of: solidarytech
+data:
+  server.py: |
+    #!/usr/bin/env python3
+    """
+    Self-Healing Webhook Server
+    Recebe alertas do Alertmanager e executa rollout restart.
+    """
+    import json
+    import subprocess
+    import os
+    import logging
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    from datetime import datetime
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s'
+    )
+    log = logging.getLogger("self-healing")
+
+    # Mapeamento de service_name para namespace
+    SERVICE_NAMESPACE_MAP = {
+        "donation-service": "solidarytech-donation",
+        "ngo-service": "solidarytech-ngo",
+        "volunteer-service": "solidarytech-volunteer",
+    }
+
+    DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
+
+    def send_discord_notification(service, namespace, success, details=""):
+        """Envia notificação para o Discord sobre a ação de self-healing."""
+        if not DISCORD_WEBHOOK_URL:
+            log.info("DISCORD_WEBHOOK_URL não configurado, pulando notificação.")
+            return
+
+        emoji = "✅" if success else "❌"
+        color = 3066993 if success else 15158332
+        status_msg = "executado com sucesso" if success else "FALHOU"
+
+        payload = {
+            "embeds": [{
+                "title": f"{emoji} Self-Healing: {service}",
+                "description": f"Rollout restart {status_msg}",
+                "color": color,
+                "fields": [
+                    {"name": "Serviço", "value": service, "inline": True},
+                    {"name": "Namespace", "value": namespace, "inline": True},
+                    {"name": "Ação", "value": "kubectl rollout restart", "inline": True},
+                ],
+                "footer": {"text": f"SolidaryTech Self-Healing | {details}"},
+                "timestamp": datetime.utcnow().isoformat() + "Z"
+            }]
+        }
+
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                DISCORD_WEBHOOK_URL,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                "Content-Type": "application/json",
+                "User-Agent": "SolidaryTech-SelfHealing/1.0 (Discord Webhook)",
+                },
+                method="POST"
+            )
+            urllib.request.urlopen(req, timeout=10)
+            log.info("Notificação enviada para o Discord.")
+        except Exception as e:
+            log.error(f"Falha ao enviar notificação Discord: {e}")
+
+    def execute_rollout_restart(service_name, namespace):
+        """Executa kubectl rollout restart no deployment."""
+        cmd = [
+            "kubectl", "rollout", "restart",
+            f"deployment/{service_name}",
+            "-n", namespace
+        ]
+
+        log.info(f"Executando: {' '.join(cmd)}")
+
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=30
+            )
+
+            if result.returncode == 0:
+                log.info(f"✅ Rollout restart OK: {result.stdout.strip()}")
+                send_discord_notification(service_name, namespace, True, result.stdout.strip())
+                return True
+            else:
+                log.error(f"❌ Rollout restart FALHOU: {result.stderr.strip()}")
+                send_discord_notification(service_name, namespace, False, result.stderr.strip())
+                return False
+        except subprocess.TimeoutExpired:
+            log.error("❌ Timeout ao executar rollout restart")
+            send_discord_notification(service_name, namespace, False, "Timeout")
+            return False
+        except Exception as e:
+            log.error(f"❌ Erro inesperado: {e}")
+            send_discord_notification(service_name, namespace, False, str(e))
+            return False
+
+    class AlertHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+
+            try:
+                payload = json.loads(body)
+            except json.JSONDecodeError:
+                log.error("Payload inválido recebido")
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b'{"error": "invalid JSON"}')
+                return
+
+            alerts = payload.get("alerts", [])
+            log.info(f"Recebidos {len(alerts)} alertas do Alertmanager")
+
+            results = []
+            for alert in alerts:
+                status = alert.get("status", "unknown")
+                labels = alert.get("labels", {})
+                service_name = labels.get("service_name", "unknown")
+                self_healing = labels.get("self_healing", "false")
+
+                log.info(f"Alerta: {labels.get('alertname')} | "
+                         f"Serviço: {service_name} | "
+                         f"Status: {status} | "
+                         f"Self-healing: {self_healing}")
+
+                # Só executa self-healing se:
+                # 1. O alerta está firing (não resolved)
+                # 2. O label self_healing é "true"
+                # 3. O serviço é conhecido
+                if status != "firing":
+                    log.info(f"Alerta resolved para {service_name}, nenhuma ação necessária.")
+                    continue
+
+                if self_healing != "true":
+                    log.info(f"Alerta sem label self_healing=true, ignorando.")
+                    continue
+
+                namespace = SERVICE_NAMESPACE_MAP.get(service_name)
+                if not namespace:
+                    log.warning(f"Serviço desconhecido: {service_name}")
+                    continue
+
+                log.info(f"🔄 Iniciando self-healing para {service_name} em {namespace}")
+                success = execute_rollout_restart(service_name, namespace)
+                results.append({
+                    "service": service_name,
+                    "namespace": namespace,
+                    "success": success
+                })
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"results": results}).encode())
+
+        def do_GET(self):
+            """Health check endpoint."""
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"status": "ok", "service": "self-healing-webhook"}')
+
+        def log_message(self, format, *args):
+            log.info(f"{self.client_address[0]} - {format % args}")
+
+    if __name__ == "__main__":
+        port = int(os.getenv("PORT", "9095"))
+        server = HTTPServer(("0.0.0.0", port), AlertHandler)
+        log.info(f"Self-Healing webhook server rodando na porta {port}")
+        server.serve_forever()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: self-healing-webhook
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: self-healing
+    app.kubernetes.io/component: self-healing
+    app.kubernetes.io/part-of: solidarytech
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: self-healing
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: self-healing
+        app.kubernetes.io/component: self-healing
+        app.kubernetes.io/part-of: solidarytech
+    spec:
+      serviceAccountName: self-healing-sa
+      containers:
+        - name: webhook-server
+          # Usa imagem leve com Python + kubectl já instalado
+          image: alpine/k8s:1.29.2
+          command: ["python3", "/app/server.py"]
+          ports:
+            - name: http
+              containerPort: 9095
+          env:
+            - name: PORT
+              value: "9095"
+            - name: DISCORD_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: self-healing-secrets
+                  key: DISCORD_WEBHOOK_URL
+                  optional: true
+          volumeMounts:
+            - name: script
+              mountPath: /app
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 9095
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 9095
+            initialDelaySeconds: 60
+            periodSeconds: 10
+      volumes:
+        - name: script
+          configMap:
+            name: self-healing-script
+            defaultMode: 0755
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: self-healing-webhook
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: self-healing
+    app.kubernetes.io/part-of: solidarytech
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: self-healing
+  ports:
+    - name: http
+      port: 9095
+      targetPort: 9095

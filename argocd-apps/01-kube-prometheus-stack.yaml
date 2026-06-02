@@ -1,0 +1,197 @@
+# =============================================================================
+# Application 1/4: kube-prometheus-stack
+# Prometheus + Grafana + Alertmanager + node-exporter + kube-state-metrics
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kube-prometheus-stack
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: solidarytech
+    app.kubernetes.io/component: observability
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://prometheus-community.github.io/helm-charts
+    chart: kube-prometheus-stack
+    targetRevision: "83.4.2"
+    helm:
+      values: |
+        # -----------------------------------------------------------------
+        # Prometheus Operator — desabilita admission webhooks TLS
+        # Motivo: em ambientes de lab o cert do webhook não sobe direito
+        # e o StatefulSet do Prometheus nunca é criado.
+        # -----------------------------------------------------------------
+        prometheusOperator:
+          admissionWebhooks:
+            enabled: false
+          tls:
+            enabled: false
+
+        # -----------------------------------------------------------------
+        # Prometheus
+        # -----------------------------------------------------------------
+        prometheus:
+          prometheusSpec:
+            retention: 7d
+            enableRemoteWriteReceiver: true
+            # Sem PVC — emptyDir. AWS Academy sem EBS CSI Driver.
+            podMonitorNamespaceSelector: {}
+            serviceMonitorNamespaceSelector: {}
+            ruleSelectorNilUsesHelmValues: false
+            serviceMonitorSelectorNilUsesHelmValues: false
+            podMonitorSelectorNilUsesHelmValues: false
+            routePrefix: /prometheus
+            externalUrl: http://solidarytech.pt/prometheus
+            resources:
+              requests:
+                cpu: 200m
+                memory: 512Mi
+              limits:
+                cpu: 500m
+                memory: 1Gi
+          ingress:
+            enabled: true
+            ingressClassName: nginx
+            annotations:
+              nginx.ingress.kubernetes.io/ssl-redirect: "false"
+              nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+            hosts:
+              - solidarytech.pt
+            paths:
+              - /prometheus
+            pathType: Prefix
+
+        # -----------------------------------------------------------------
+        # Grafana
+        # Credenciais vêm do Secret "grafana-admin-credentials", gerado pelo
+        # ExternalSecret que lê solidarytech/monitoring no AWS Secrets Manager.
+        # -----------------------------------------------------------------
+        grafana:
+          enabled: true
+          admin:
+            existingSecret: grafana-admin-credentials
+            userKey: admin-user
+            passwordKey: admin-password
+          persistence:
+            enabled: false
+          additionalDataSources:
+            - name: Loki
+              type: loki
+              uid: loki
+              access: proxy
+              url: http://loki-stack.monitoring.svc.cluster.local:3100
+              isDefault: false
+              jsonData:
+                maxLines: 1000
+          dashboardProviders:
+            dashboardproviders.yaml:
+              apiVersion: 1
+              providers:
+                - name: solidarytech
+                  orgId: 1
+                  folder: SolidaryTech
+                  type: file
+                  disableDeletion: false
+                  editable: true
+                  options:
+                    path: /var/lib/grafana/dashboards/solidarytech
+          dashboardsConfigMaps:
+            solidarytech: grafana-dashboards
+          ingress:
+            enabled: true
+            ingressClassName: nginx
+            annotations:
+              nginx.ingress.kubernetes.io/ssl-redirect: "false"
+              nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+            hosts:
+              - solidarytech.pt
+            path: /grafana
+            pathType: Prefix
+          grafana.ini:
+            server:
+              root_url: "%(protocol)s://%(domain)s/grafana/"
+              serve_from_sub_path: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 300m
+              memory: 512Mi
+
+        # -----------------------------------------------------------------
+        # Alertmanager
+        # -----------------------------------------------------------------
+        alertmanager:
+          enabled: true
+          alertmanagerSpec:
+            routePrefix: /alertmanager
+            externalUrl: http://solidarytech.pt/alertmanager
+            # Usa o Secret alertmanager-config gerado pelo ExternalSecret,
+            # que monta o alertmanager.yaml com as credenciais reais vindas
+            # de solidarytech/monitoring no AWS Secrets Manager.
+            configSecret: alertmanager-config
+          ingress:
+            enabled: true
+            ingressClassName: nginx
+            annotations:
+              nginx.ingress.kubernetes.io/ssl-redirect: "false"
+              nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+            hosts:
+              - solidarytech.pt
+            paths:
+              - /alertmanager
+            pathType: Prefix
+
+        # -----------------------------------------------------------------
+        # Exporters padrão
+        # -----------------------------------------------------------------
+        nodeExporter:
+          enabled: true
+        kubeStateMetrics:
+          enabled: true
+
+        # -----------------------------------------------------------------
+        # Control plane gerenciado pela AWS (EKS)
+        # A AWS NÃO expõe métricas de scheduler / controller-manager / etcd,
+        # então desabilitamos os ServiceMonitors — se ficarem habilitados o
+        # Prometheus falha no scrape e dispara falso-positivos "Down".
+        # -----------------------------------------------------------------
+        kubeControllerManager:
+          enabled: false
+        kubeScheduler:
+          enabled: false
+        kubeEtcd:
+          enabled: false
+        defaultRules:
+          create: true
+          rules:
+            kubeControllerManager: false
+            kubeScheduler: false
+            kubeProxy: true
+            etcd: false
+            kubernetesSystemApiserver: true
+            kubernetesSystemKubelet: true
+            kubernetesSystemScheduler: false
+            kubernetesSystemControllerManager: false
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m

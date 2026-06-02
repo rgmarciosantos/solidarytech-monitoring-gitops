@@ -1,0 +1,36 @@
+# =============================================================================
+# Sync-wave -10: sobe PRIMEIRO.
+# O solidarytech-root cria esta Application, aguarda ela ficar Synced+Healthy
+# (o que significa que todas as 4 Applications filhas dela estão OK), e só
+# então libera a wave 10 (microsserviços).
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: monitoring-app-of-apps
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: solidarytech
+    app.kubernetes.io/component: observability
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/brianmonteiro54/solidarytech-monitoring-gitops.git
+    targetRevision: main
+    path: argocd-apps
+    directory:
+      recurse: false
+      include: "*.yaml"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

@@ -1,0 +1,45 @@
+# =============================================================================
+# SolidaryTech - Monitoring App-of-Apps
+# =============================================================================
+# Este é o ÚNICO manifesto que precisa de `kubectl apply` manual.
+# Ele cria uma Application "pai" que varre a pasta argocd-apps/ do Git
+# e registra automaticamente as 4 Applications filhas:
+#   - kube-prometheus-stack (Prometheus + Grafana + Alertmanager)
+#   - loki-stack (Loki + Promtail)
+#   - otel-collector (OpenTelemetry Collector)
+#   - monitoring-manifests (namespace, ServiceMonitors, dashboards, alertas, self-healing)
+#
+# COMO USAR:
+#   kubectl apply -f monitoring-app-of-apps.yaml
+#
+# O ArgoCD cuida do resto. Mudanças futuras nos arquivos de argocd-apps/
+# ou manifests/ são sincronizadas automaticamente após git push.
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: solidarytech-root
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: solidarytech
+    app.kubernetes.io/component: root
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/brianmonteiro54/solidarytech-monitoring-gitops.git
+    targetRevision: main
+    path: apps
+    directory:
+      recurse: false
+      include: "*.yaml"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

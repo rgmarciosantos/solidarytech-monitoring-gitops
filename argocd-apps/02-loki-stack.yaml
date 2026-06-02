@@ -1,0 +1,150 @@
+# =============================================================================
+# Application 2/4: loki-stack
+# Loki + Promtail (DaemonSet)
+# =============================================================================
+# =============================================================================
+# PRÉ-REQUISITOS (uma única vez):
+#   1) Criar o bucket S3:
+#        aws s3 mb s3://solidarytech-loki-$(aws sts get-caller-identity --query Account --output text) --region us-east-1
+#   2) Garantir que o Secret aws-credentials existe no namespace monitoring
+#      (mesmo secret que o SecretStore do External Secrets já usa).
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: loki-stack
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: solidarytech
+    app.kubernetes.io/component: observability
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://grafana.github.io/helm-charts
+    chart: loki-stack
+    targetRevision: "2.10.3"
+    helm:
+      values: |
+        grafana:
+          enabled: false
+          sidecar:
+            datasources:
+              enabled: false
+        prometheus:
+          enabled: false
+        fluent-bit:
+          enabled: false
+        filebeat:
+          enabled: false
+        logstash:
+          enabled: false
+
+        loki:
+          enabled: true
+          image:
+            repository: grafana/loki
+            tag: "2.9.10"
+            pullPolicy: IfNotPresent
+          persistence:
+            enabled: false
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: access-key
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: secret-access-key
+            - name: AWS_SESSION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: session-token
+          config:
+            limits_config:
+              retention_period: 168h
+              max_streams_per_user: 10000
+            schema_config:
+              configs:
+                - from: "2024-01-01"
+                  store: boltdb-shipper
+                  object_store: s3
+                  schema: v11
+                  index:
+                    prefix: index_
+                    period: 24h
+            storage_config:
+              aws:
+                s3: s3://us-east-1/solidarytech-loki-042702827117
+                region: us-east-1
+                s3forcepathstyle: true
+              boltdb_shipper:
+                active_index_directory: /data/loki/boltdb-shipper-active
+                cache_location: /data/loki/boltdb-shipper-cache
+                shared_store: s3
+            compactor:
+              working_directory: /data/loki/compactor
+              shared_store: s3
+              compaction_interval: 10m
+              retention_enabled: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 300m
+              memory: 512Mi
+
+        promtail:
+          enabled: true
+          config:
+            clients:
+              - url: http://loki-stack.monitoring.svc.cluster.local:3100/loki/api/v1/push
+            snippets:
+              pipelineStages:
+                - cri: {}
+                - multiline:
+                    firstline: '^\d{4}-\d{2}-\d{2}|^[A-Z]{3,5}\s|^\{|^time='
+                    max_wait_time: 3s
+                - labeldrop:
+                    - filename
+              extraRelabelConfigs:
+                - action: replace
+                  source_labels:
+                    - __meta_kubernetes_namespace
+                  target_label: namespace
+                - action: replace
+                  source_labels:
+                    - __meta_kubernetes_pod_label_app_kubernetes_io_name
+                  target_label: service
+                - action: replace
+                  source_labels:
+                    - __meta_kubernetes_pod_name
+                  target_label: pod
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m

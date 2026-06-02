@@ -1,0 +1,89 @@
+# PrometheusRule para alertas inteligentes
+# Integra com Alertmanager → PagerDuty → Discord → Self-Healing
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: solidarytech-alerts
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: solidarytech
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: solidarytech.rules
+      rules:
+        # Alerta: Taxa de erros HTTP 5xx > 5% por 2 minutos
+        - alert: HighErrorRate5xx
+          expr: |
+            (
+              sum(rate(http_server_request_duration_seconds_count{service_namespace="solidarytech", http_response_status_code=~"5.."}[5m])) by (service_name)
+              /
+              sum(rate(http_server_request_duration_seconds_count{service_namespace="solidarytech"}[5m])) by (service_name)
+            ) * 100 > 5
+          for: 2m
+          labels:
+            severity: critical
+            team: solidarytech
+            self_healing: "true"
+          annotations:
+            summary: "Alta taxa de erros 5xx no {{ $labels.service_name }}"
+            description: "O serviço {{ $labels.service_name }} está com {{ $value | printf \"%.1f\" }}% de erros 5xx nos últimos 5 minutos. Threshold: 5%."
+            runbook_url: "https://github.com/brianmonteiro54/solidarytech-runbooks/blob/main/high-error-rate.md"
+            dashboard_url: "http://solidarytech.pt/grafana/d/solidarytech-overview"
+
+        # Alerta: Pod com muitos restarts
+        - alert: PodCrashLooping
+          expr: |
+            increase(kube_pod_container_status_restarts_total{namespace=~"solidarytech-.*"}[15m]) > 3
+          for: 5m
+          labels:
+            severity: warning
+            team: solidarytech
+          annotations:
+            summary: "Pod {{ $labels.pod }} em crash loop"
+            description: "O pod {{ $labels.pod }} no namespace {{ $labels.namespace }} reiniciou {{ $value | printf \"%.0f\" }} vezes nos últimos 15 minutos."
+
+        # Alerta: Alta latência P95
+        - alert: HighLatencyP95
+          expr: |
+            histogram_quantile(0.95, sum(rate(http_server_request_duration_seconds_bucket{service_namespace="solidarytech"}[5m])) by (le, service_name)) > 2
+          for: 3m
+          labels:
+            severity: warning
+            team: solidarytech
+          annotations:
+            summary: "Alta latência P95 no {{ $labels.service_name }}"
+            description: "O serviço {{ $labels.service_name }} está com latência P95 de {{ $value | printf \"%.2f\" }}s. Threshold: 2s."
+
+        # Alerta: Uso alto de memória
+        - alert: HighMemoryUsage
+          expr: |
+            (
+              sum(container_memory_working_set_bytes{namespace=~"solidarytech-.*"}) by (pod, namespace)
+              /
+              sum(kube_pod_container_resource_limits{namespace=~"solidarytech-.*", resource="memory"}) by (pod, namespace)
+            ) * 100 > 85
+          for: 5m
+          labels:
+            severity: warning
+            team: solidarytech
+          annotations:
+            summary: "Alto uso de memória no pod {{ $labels.pod }}"
+            description: "O pod {{ $labels.pod }} está usando {{ $value | printf \"%.0f\" }}% do limite de memória."
+
+        # Alerta: Servico fora do ar (deployment com 0 replicas disponiveis)
+        - alert: ServiceDown
+          expr: |
+            label_replace(
+              kube_deployment_status_replicas_available{namespace=~"solidarytech-.*"} == 0,
+              "service_name", "$1", "deployment", "(.*)"
+            )
+          for: 1m
+          labels:
+            severity: critical
+            team: solidarytech
+            self_healing: "true"
+          annotations:
+            summary: "Servico {{ $labels.service_name }} esta DOWN"
+            description: "O deployment {{ $labels.deployment }} no namespace {{ $labels.namespace }} esta com 0 replicas disponiveis"

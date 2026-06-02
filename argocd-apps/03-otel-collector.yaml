@@ -1,0 +1,157 @@
+# =============================================================================
+# Application 3/4: otel-collector
+# OpenTelemetry Collector (hub central de observabilidade)
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: otel-collector
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: solidarytech
+    app.kubernetes.io/component: observability
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://open-telemetry.github.io/opentelemetry-helm-charts
+    chart: opentelemetry-collector
+    targetRevision: "0.146.1"
+    helm:
+      values: |
+        # ---------------------------------------------------------------
+        # Imagem contrib — contém todos os exporters (prometheusremotewrite etc)
+        # ---------------------------------------------------------------
+        image:
+          repository: "otel/opentelemetry-collector-contrib"
+
+        mode: deployment
+        replicaCount: 1
+
+        # ---------------------------------------------------------------
+        # Env vars extras — injeta a New Relic API key no container.
+        # A config abaixo referencia esta var via ${env:NEW_RELIC_API_KEY}.
+        # ---------------------------------------------------------------
+        extraEnvs:
+          - name: NEW_RELIC_API_KEY
+            valueFrom:
+              secretKeyRef:
+                name: otel-collector-secrets
+                key: NEW_RELIC_API_KEY
+
+        ports:
+          otlp:
+            enabled: true
+            containerPort: 4317
+            servicePort: 4317
+            protocol: TCP
+          otlp-http:
+            enabled: true
+            containerPort: 4318
+            servicePort: 4318
+            protocol: TCP
+          prometheus:
+            enabled: true
+            containerPort: 8889
+            servicePort: 8889
+            protocol: TCP
+
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+
+        config:
+          receivers:
+            otlp:
+              protocols:
+                grpc:
+                  endpoint: 0.0.0.0:4317
+                http:
+                  endpoint: 0.0.0.0:4318
+
+          processors:
+            batch:
+              timeout: 5s
+              send_batch_size: 1024
+            memory_limiter:
+              check_interval: 5s
+              limit_mib: 400
+              spike_limit_mib: 100
+            resource:
+              attributes:
+                - key: service.namespace
+                  value: solidarytech
+                  action: upsert
+                - key: deployment.environment
+                  value: production
+                  action: upsert
+
+          exporters:
+            # Metrics -> Prometheus interno
+            # IMPORTANTE: o endpoint precisa do prefixo /prometheus porque o
+            # kube-prometheus-stack está configurado com routePrefix: /prometheus
+            # no prometheusSpec. Sem o prefixo, retorna 404.
+            prometheusremotewrite:
+              endpoint: "http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090/prometheus/api/v1/write"
+              resource_to_telemetry_conversion:
+                enabled: true
+
+            # Logs -> Loki interno
+            # O Service se chama "loki-stack" (não "loki"), porque o chart
+            # loki-stack nomeia o Service como {{ .Release.Name }}-stack.
+            otlphttp/loki:
+              endpoint: "http://loki-stack.monitoring.svc.cluster.local:3100/otlp"
+              tls:
+                insecure: true
+
+            # Traces + Metrics + Logs -> New Relic (APM externo)
+            # A api-key vem da env var NEW_RELIC_API_KEY, injetada via
+            # extraEnvs a partir do Secret otel-collector-secrets.
+            otlp/newrelic:
+              endpoint: "https://otlp.nr-data.net:4317"
+              headers:
+                api-key: "${env:NEW_RELIC_API_KEY}"
+
+            debug:
+              verbosity: basic
+
+          extensions:
+            health_check:
+              endpoint: 0.0.0.0:13133
+
+          service:
+            extensions: [health_check]
+            pipelines:
+              metrics:
+                receivers: [otlp]
+                processors: [memory_limiter, resource, batch]
+                exporters: [prometheusremotewrite, otlp/newrelic]
+              logs:
+                receivers: [otlp]
+                processors: [memory_limiter, resource, batch]
+                exporters: [otlp/newrelic]
+              traces:
+                receivers: [otlp]
+                processors: [memory_limiter, resource, batch]
+                exporters: [otlp/newrelic, debug]
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m

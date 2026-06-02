@@ -1,0 +1,44 @@
+# RBAC para Self-Healing
+# Se optar por usar um CronJob/Job no cluster ao invés de GitHub Actions,
+# este ServiceAccount tem permissão para fazer rollout restart.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: self-healing-sa
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: solidarytech
+    app.kubernetes.io/component: self-healing
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: self-healing-role
+  labels:
+    app.kubernetes.io/part-of: solidarytech
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "patch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: self-healing-binding
+  labels:
+    app.kubernetes.io/part-of: solidarytech
+subjects:
+  - kind: ServiceAccount
+    name: self-healing-sa
+    namespace: monitoring
+roleRef:
+  kind: ClusterRole
+  name: self-healing-role
+  apiGroup: rbac.authorization.k8s.io

@@ -1,0 +1,32 @@
+# =============================================================================
+# ServiceMonitors do SolidaryTech
+# =============================================================================
+# Só o donation-service (Go) expõe /metrics (via promhttp), então só ele tem
+# ServiceMonitor raspando /metrics diretamente.
+#
+# O ngo-service e o volunteer-service (Python) são instrumentados com OTel e
+# enviam métricas via OTLP para o OpenTelemetry Collector, que faz
+# prometheusremotewrite para o Prometheus. Por isso NÃO têm ServiceMonitor —
+# se tivessem, o alvo /metrics ficaria "Down" (falso-positivo de TargetDown).
+# As métricas HTTP deles (http_server_request_duration_seconds_*) chegam ao
+# Prometheus do mesmo jeito, via o collector.
+# =============================================================================
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: donation-service
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: solidarytech
+spec:
+  namespaceSelector:
+    matchNames:
+      - solidarytech-donation
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: donation-service
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
