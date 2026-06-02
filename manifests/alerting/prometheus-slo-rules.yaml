@@ -1,0 +1,304 @@
+# =============================================================================
+# SolidaryTech — SLO / Error Budget (Etapa 7 — SRE)
+# =============================================================================
+# Recording rules + alertas multi-window/multi-burn-rate (padrão Google SRE
+# Workbook) para os 3 microsserviços. Some este arquivo a manifests/alerting/
+# do repositório solidarytech-monitoring-gitops (o ArgoCD aplica automaticamente).
+#
+# Métricas de origem (já chegam ao Prometheus via OTel Collector -> remote-write):
+#   http_server_request_duration_seconds_count{service_namespace,service_name,http_response_status_code}
+#   http_server_request_duration_seconds_bucket{service_namespace,service_name,le}
+#
+# SLOs (janela de 28 dias):
+#   donation-service  : disponibilidade 99,9%  (budget 0,1%) + latência 99% < 500ms (budget 1%)
+#   ngo-service       : disponibilidade 99,5%  (budget 0,5%)
+#   volunteer-service : disponibilidade 99,5%  (budget 0,5%)
+#
+# Limiares de burn-rate = burn_rate * (1 - SLO):
+#   fast  (1h & 5m)  -> 14.4 * budget   [page / critical]
+#   medium(6h & 30m) ->  6   * budget   [page / critical]
+#   slow  (3d & 6h)  ->  1   * budget   [ticket / warning]
+#
+# ATENÇÃO — retenção do Prometheus: o kube-prometheus-stack está com
+# `retention: 7d`. As regras de ratio28d e os painéis de "budget restante 28d"
+# só refletem 28 dias reais se a retenção for >= 28d. Para SLO de 28/30 dias,
+# ajuste em argocd-apps/01-kube-prometheus-stack.yaml -> prometheusSpec.retention: 30d.
+# Os alertas usam janelas <= 3d, então funcionam dentro dos 7d atuais.
+# =============================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: solidarytech-slo-rules
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: solidarytech
+    app.kubernetes.io/component: sre
+    release: kube-prometheus-stack
+spec:
+  groups:
+    # =========================================================================
+    # 1) RECORDING RULES — razões de erro por serviço, por janela
+    # =========================================================================
+    - name: solidarytech-slo.recording
+      interval: 30s
+      rules:
+        # ---- Disponibilidade: razão de respostas 5xx sobre o total ----------
+        - record: service:slo_availability_errors:ratio5m
+          expr: |
+            sum by (service_name) (rate(http_server_request_duration_seconds_count{service_namespace="solidarytech", http_response_status_code=~"5.."}[5m]))
+            /
+            sum by (service_name) (rate(http_server_request_duration_seconds_count{service_namespace="solidarytech"}[5m]))
+        - record: service:slo_availability_errors:ratio30m
+          expr: |
+            sum by (service_name) (rate(http_server_request_duration_seconds_count{service_namespace="solidarytech", http_response_status_code=~"5.."}[30m]))
+            /
+            sum by (service_name) (rate(http_server_request_duration_seconds_count{service_namespace="solidarytech"}[30m]))
+        - record: service:slo_availability_errors:ratio1h
+          expr: |
+            sum by (service_name) (rate(http_server_request_duration_seconds_count{service_namespace="solidarytech", http_response_status_code=~"5.."}[1h]))
+            /
+            sum by (service_name) (rate(http_server_request_duration_seconds_count{service_namespace="solidarytech"}[1h]))
+        - record: service:slo_availability_errors:ratio6h
+          expr: |
+            sum by (service_name) (rate(http_server_request_duration_seconds_count{service_namespace="solidarytech", http_response_status_code=~"5.."}[6h]))
+            /
+            sum by (service_name) (rate(http_server_request_duration_seconds_count{service_namespace="solidarytech"}[6h]))
+        - record: service:slo_availability_errors:ratio1d
+          expr: |
+            sum by (service_name) (rate(http_server_request_duration_seconds_count{service_namespace="solidarytech", http_response_status_code=~"5.."}[1d]))
+            /
+            sum by (service_name) (rate(http_server_request_duration_seconds_count{service_namespace="solidarytech"}[1d]))
+        - record: service:slo_availability_errors:ratio3d
+          expr: |
+            sum by (service_name) (rate(http_server_request_duration_seconds_count{service_namespace="solidarytech", http_response_status_code=~"5.."}[3d]))
+            /
+            sum by (service_name) (rate(http_server_request_duration_seconds_count{service_namespace="solidarytech"}[3d]))
+        - record: service:slo_availability_errors:ratio28d
+          expr: |
+            sum by (service_name) (rate(http_server_request_duration_seconds_count{service_namespace="solidarytech", http_response_status_code=~"5.."}[28d]))
+            /
+            sum by (service_name) (rate(http_server_request_duration_seconds_count{service_namespace="solidarytech"}[28d]))
+
+        # ---- Latência: proporção de requisições MAIS LENTAS que 500ms --------
+        # good = bucket le="0.5" (precisa existir como fronteira do histograma;
+        # 0.5s é uma fronteira padrão do OpenTelemetry). erro = 1 - good/total.
+        - record: service:slo_latency_errors:ratio5m
+          expr: |
+            1 - (
+              sum by (service_name) (rate(http_server_request_duration_seconds_bucket{service_namespace="solidarytech", le="0.5"}[5m]))
+              /
+              sum by (service_name) (rate(http_server_request_duration_seconds_count{service_namespace="solidarytech"}[5m]))
+            )
+        - record: service:slo_latency_errors:ratio30m
+          expr: |
+            1 - (
+              sum by (service_name) (rate(http_server_request_duration_seconds_bucket{service_namespace="solidarytech", le="0.5"}[30m]))
+              /
+              sum by (service_name) (rate(http_server_request_duration_seconds_count{service_namespace="solidarytech"}[30m]))
+            )
+        - record: service:slo_latency_errors:ratio1h
+          expr: |
+            1 - (
+              sum by (service_name) (rate(http_server_request_duration_seconds_bucket{service_namespace="solidarytech", le="0.5"}[1h]))
+              /
+              sum by (service_name) (rate(http_server_request_duration_seconds_count{service_namespace="solidarytech"}[1h]))
+            )
+        - record: service:slo_latency_errors:ratio6h
+          expr: |
+            1 - (
+              sum by (service_name) (rate(http_server_request_duration_seconds_bucket{service_namespace="solidarytech", le="0.5"}[6h]))
+              /
+              sum by (service_name) (rate(http_server_request_duration_seconds_count{service_namespace="solidarytech"}[6h]))
+            )
+        - record: service:slo_latency_errors:ratio3d
+          expr: |
+            1 - (
+              sum by (service_name) (rate(http_server_request_duration_seconds_bucket{service_namespace="solidarytech", le="0.5"}[3d]))
+              /
+              sum by (service_name) (rate(http_server_request_duration_seconds_count{service_namespace="solidarytech"}[3d]))
+            )
+        - record: service:slo_latency_errors:ratio28d
+          expr: |
+            1 - (
+              sum by (service_name) (rate(http_server_request_duration_seconds_bucket{service_namespace="solidarytech", le="0.5"}[28d]))
+              /
+              sum by (service_name) (rate(http_server_request_duration_seconds_count{service_namespace="solidarytech"}[28d]))
+            )
+
+    # =========================================================================
+    # 2) ALERTAS — multi-window / multi-burn-rate
+    # =========================================================================
+    - name: solidarytech-slo.alerts
+      rules:
+        # ---------------- donation-service — DISPONIBILIDADE (SLO 99,9%) ------
+        - alert: DonationAvailabilityFastBurn
+          expr: |
+            service:slo_availability_errors:ratio1h{service_name="donation-service"} > (14.4 * 0.001)
+            and
+            service:slo_availability_errors:ratio5m{service_name="donation-service"} > (14.4 * 0.001)
+          for: 2m
+          labels:
+            severity: critical
+            team: solidarytech
+            slo: donation-availability
+            service_name: donation-service
+          annotations:
+            summary: "Queima RÁPIDA do error budget de disponibilidade do donation-service"
+            description: "Erros 5xx consumindo o orçamento ~14,4x mais rápido que o permitido (SLO 99,9%). A 2% do budget de 28 dias por hora."
+            dashboard_url: "http://solidarytech.pt/grafana/d/solidarytech-slo"
+        - alert: DonationAvailabilityMediumBurn
+          expr: |
+            service:slo_availability_errors:ratio6h{service_name="donation-service"} > (6 * 0.001)
+            and
+            service:slo_availability_errors:ratio30m{service_name="donation-service"} > (6 * 0.001)
+          for: 15m
+          labels:
+            severity: critical
+            team: solidarytech
+            slo: donation-availability
+            service_name: donation-service
+          annotations:
+            summary: "Queima MÉDIA do error budget de disponibilidade do donation-service"
+            description: "Erros 5xx consumindo o orçamento ~6x mais rápido que o permitido (SLO 99,9%)."
+            dashboard_url: "http://solidarytech.pt/grafana/d/solidarytech-slo"
+        - alert: DonationAvailabilitySlowBurn
+          expr: |
+            service:slo_availability_errors:ratio3d{service_name="donation-service"} > (1 * 0.001)
+            and
+            service:slo_availability_errors:ratio6h{service_name="donation-service"} > (1 * 0.001)
+          for: 1h
+          labels:
+            severity: warning
+            team: solidarytech
+            slo: donation-availability
+            service_name: donation-service
+          annotations:
+            summary: "Queima LENTA do error budget de disponibilidade do donation-service"
+            description: "Tendência de consumo do orçamento no ritmo de esgotá-lo em ~28 dias (SLO 99,9%)."
+            dashboard_url: "http://solidarytech.pt/grafana/d/solidarytech-slo"
+
+        # ---------------- donation-service — LATÊNCIA (SLO 99% < 500ms) -------
+        - alert: DonationLatencyFastBurn
+          expr: |
+            service:slo_latency_errors:ratio1h{service_name="donation-service"} > (14.4 * 0.01)
+            and
+            service:slo_latency_errors:ratio5m{service_name="donation-service"} > (14.4 * 0.01)
+          for: 2m
+          labels:
+            severity: critical
+            team: solidarytech
+            slo: donation-latency
+            service_name: donation-service
+          annotations:
+            summary: "Queima RÁPIDA do error budget de latência do donation-service"
+            description: "Proporção de requisições acima de 500ms consumindo o orçamento ~14,4x mais rápido que o permitido (SLO 99% < 500ms)."
+            dashboard_url: "http://solidarytech.pt/grafana/d/solidarytech-slo"
+        - alert: DonationLatencySlowBurn
+          expr: |
+            service:slo_latency_errors:ratio3d{service_name="donation-service"} > (1 * 0.01)
+            and
+            service:slo_latency_errors:ratio6h{service_name="donation-service"} > (1 * 0.01)
+          for: 1h
+          labels:
+            severity: warning
+            team: solidarytech
+            slo: donation-latency
+            service_name: donation-service
+          annotations:
+            summary: "Queima LENTA do error budget de latência do donation-service"
+            description: "Latência acima de 500ms tendendo a esgotar o orçamento em ~28 dias (SLO 99% < 500ms)."
+            dashboard_url: "http://solidarytech.pt/grafana/d/solidarytech-slo"
+
+        # ---------------- ngo-service — DISPONIBILIDADE (SLO 99,5%) -----------
+        - alert: NgoAvailabilityFastBurn
+          expr: |
+            service:slo_availability_errors:ratio1h{service_name="ngo-service"} > (14.4 * 0.005)
+            and
+            service:slo_availability_errors:ratio5m{service_name="ngo-service"} > (14.4 * 0.005)
+          for: 2m
+          labels:
+            severity: critical
+            team: solidarytech
+            slo: ngo-availability
+            service_name: ngo-service
+          annotations:
+            summary: "Queima RÁPIDA do error budget de disponibilidade do ngo-service"
+            description: "Erros 5xx consumindo o orçamento ~14,4x mais rápido que o permitido (SLO 99,5%)."
+            dashboard_url: "http://solidarytech.pt/grafana/d/solidarytech-slo"
+        - alert: NgoAvailabilityMediumBurn
+          expr: |
+            service:slo_availability_errors:ratio6h{service_name="ngo-service"} > (6 * 0.005)
+            and
+            service:slo_availability_errors:ratio30m{service_name="ngo-service"} > (6 * 0.005)
+          for: 15m
+          labels:
+            severity: critical
+            team: solidarytech
+            slo: ngo-availability
+            service_name: ngo-service
+          annotations:
+            summary: "Queima MÉDIA do error budget de disponibilidade do ngo-service"
+            description: "Erros 5xx consumindo o orçamento ~6x mais rápido que o permitido (SLO 99,5%)."
+            dashboard_url: "http://solidarytech.pt/grafana/d/solidarytech-slo"
+        - alert: NgoAvailabilitySlowBurn
+          expr: |
+            service:slo_availability_errors:ratio3d{service_name="ngo-service"} > (1 * 0.005)
+            and
+            service:slo_availability_errors:ratio6h{service_name="ngo-service"} > (1 * 0.005)
+          for: 1h
+          labels:
+            severity: warning
+            team: solidarytech
+            slo: ngo-availability
+            service_name: ngo-service
+          annotations:
+            summary: "Queima LENTA do error budget de disponibilidade do ngo-service"
+            description: "Tendência de esgotar o orçamento em ~28 dias (SLO 99,5%)."
+            dashboard_url: "http://solidarytech.pt/grafana/d/solidarytech-slo"
+
+        # ---------------- volunteer-service — DISPONIBILIDADE (SLO 99,5%) -----
+        - alert: VolunteerAvailabilityFastBurn
+          expr: |
+            service:slo_availability_errors:ratio1h{service_name="volunteer-service"} > (14.4 * 0.005)
+            and
+            service:slo_availability_errors:ratio5m{service_name="volunteer-service"} > (14.4 * 0.005)
+          for: 2m
+          labels:
+            severity: critical
+            team: solidarytech
+            slo: volunteer-availability
+            service_name: volunteer-service
+          annotations:
+            summary: "Queima RÁPIDA do error budget de disponibilidade do volunteer-service"
+            description: "Erros 5xx consumindo o orçamento ~14,4x mais rápido que o permitido (SLO 99,5%)."
+            dashboard_url: "http://solidarytech.pt/grafana/d/solidarytech-slo"
+        - alert: VolunteerAvailabilityMediumBurn
+          expr: |
+            service:slo_availability_errors:ratio6h{service_name="volunteer-service"} > (6 * 0.005)
+            and
+            service:slo_availability_errors:ratio30m{service_name="volunteer-service"} > (6 * 0.005)
+          for: 15m
+          labels:
+            severity: critical
+            team: solidarytech
+            slo: volunteer-availability
+            service_name: volunteer-service
+          annotations:
+            summary: "Queima MÉDIA do error budget de disponibilidade do volunteer-service"
+            description: "Erros 5xx consumindo o orçamento ~6x mais rápido que o permitido (SLO 99,5%)."
+            dashboard_url: "http://solidarytech.pt/grafana/d/solidarytech-slo"
+        - alert: VolunteerAvailabilitySlowBurn
+          expr: |
+            service:slo_availability_errors:ratio3d{service_name="volunteer-service"} > (1 * 0.005)
+            and
+            service:slo_availability_errors:ratio6h{service_name="volunteer-service"} > (1 * 0.005)
+          for: 1h
+          labels:
+            severity: warning
+            team: solidarytech
+            slo: volunteer-availability
+            service_name: volunteer-service
+          annotations:
+            summary: "Queima LENTA do error budget de disponibilidade do volunteer-service"
+            description: "Tendência de esgotar o orçamento em ~28 dias (SLO 99,5%)."
+            dashboard_url: "http://solidarytech.pt/grafana/d/solidarytech-slo"

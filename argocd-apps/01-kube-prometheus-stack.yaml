@@ -36,7 +36,7 @@ spec:
         # -----------------------------------------------------------------
         prometheus:
           prometheusSpec:
-            retention: 7d
+            retention: 30d
             enableRemoteWriteReceiver: true
             # Sem PVC — emptyDir. AWS Academy sem EBS CSI Driver.
             podMonitorNamespaceSelector: {}
