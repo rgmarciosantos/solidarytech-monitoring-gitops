@@ -1,6 +1,8 @@
 # =============================================================================
-# Self-Healing Webhook Receiver
-# Roda dentro do cluster, recebe webhooks do Alertmanager e executa
+# Self-Healing + AIOps Webhook Receiver
+# Roda dentro do cluster, recebe webhooks do Alertmanager, executa a
+# remediação (rollout restart) e gera uma análise de causa raiz do incidente
+# com GenAI (Claude API) — tudo postado em um único embed no Discord.
 # =============================================================================
 ---
 apiVersion: v1
@@ -15,13 +17,16 @@ data:
   server.py: |
     #!/usr/bin/env python3
     """
-    Self-Healing Webhook Server
-    Recebe alertas do Alertmanager e executa rollout restart.
+    Self-Healing + AIOps Webhook Server
+    Recebe alertas do Alertmanager, executa a remediação (rollout restart) e
+    gera uma análise de causa raiz do incidente com GenAI (Claude API),
+    postando tudo em um único embed no Discord.
     """
     import json
     import subprocess
     import os
     import logging
+    import urllib.request
     from http.server import HTTPServer, BaseHTTPRequestHandler
     from datetime import datetime
 
@@ -38,80 +43,145 @@ data:
         "volunteer-service": "solidarytech-volunteer",
     }
 
+    # --- Configuração (via env / Secret) ----------------------------------------
     DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 
-    def send_discord_notification(service, namespace, success, details=""):
-        """Envia notificação para o Discord sobre a ação de self-healing."""
+    # AIOps — resumo de incidente com GenAI (Claude API). Tudo best-effort:
+    # se a chave não existir ou a chamada falhar, o self-healing continua normal.
+    ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+    ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+    ANTHROPIC_BASE_URL = os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
+    AISUMMARY_MAX_TOKENS = int(os.getenv("AISUMMARY_MAX_TOKENS", "300"))
+
+
+    def generate_incident_summary(ctx):
+        """Gera uma análise de causa raiz do incidente via Claude API.
+
+        Best-effort: nunca levanta exceção e é chamada DEPOIS do rollout restart,
+        portanto não atrasa a remediação. Usa apenas a stdlib (urllib).
+        """
+        if not ANTHROPIC_API_KEY:
+            log.info("ANTHROPIC_API_KEY não configurado, pulando resumo GenAI.")
+            return None
+
+        prompt = (
+            "Você é um assistente de SRE da plataforma de doações SolidaryTech. "
+            "Com base no alerta abaixo, escreva uma análise de incidente curta e objetiva, "
+            "em português do Brasil, com três tópicos: (1) causa provável, (2) impacto para "
+            "o doador e (3) próximos passos recomendados. Máximo de 120 palavras. "
+            "Não invente métricas que não estejam no alerta.\n\n"
+            f"Alerta: {ctx.get('alertname')}\n"
+            f"Serviço: {ctx.get('service')}\n"
+            f"Severidade: {ctx.get('severity')}\n"
+            f"Resumo: {ctx.get('summary')}\n"
+            f"Descrição: {ctx.get('description')}\n"
+            f"Runbook: {ctx.get('runbook_url')}\n"
+        )
+
+        body = {
+            "model": ANTHROPIC_MODEL,
+            "max_tokens": AISUMMARY_MAX_TOKENS,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+
+        try:
+            req = urllib.request.Request(
+                f"{ANTHROPIC_BASE_URL}/v1/messages",
+                data=json.dumps(body).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+
+            parts = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
+            summary = "".join(parts).strip()
+            if summary:
+                log.info("Resumo GenAI gerado com sucesso.")
+            return summary or None
+        except Exception as e:
+            log.error(f"Falha ao gerar resumo GenAI: {e}")
+            return None
+
+
+    def execute_rollout_restart(service_name, namespace):
+        """Executa kubectl rollout restart no deployment. Retorna (success, details)."""
+        cmd = [
+            "kubectl", "rollout", "restart",
+            f"deployment/{service_name}",
+            "-n", namespace,
+        ]
+        log.info(f"Executando: {' '.join(cmd)}")
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode == 0:
+                log.info(f"✅ Rollout restart OK: {result.stdout.strip()}")
+                return True, result.stdout.strip()
+            log.error(f"❌ Rollout restart FALHOU: {result.stderr.strip()}")
+            return False, result.stderr.strip()
+        except subprocess.TimeoutExpired:
+            log.error("❌ Timeout ao executar rollout restart")
+            return False, "Timeout"
+        except Exception as e:
+            log.error(f"❌ Erro inesperado: {e}")
+            return False, str(e)
+
+
+    def send_discord_notification(ctx, action, success, details, ai_summary):
+        """Envia um único embed ao Discord com a remediação e a análise GenAI."""
         if not DISCORD_WEBHOOK_URL:
             log.info("DISCORD_WEBHOOK_URL não configurado, pulando notificação.")
             return
 
-        emoji = "✅" if success else "❌"
-        color = 3066993 if success else 15158332
-        status_msg = "executado com sucesso" if success else "FALHOU"
+        if success is None:
+            emoji, color, status_msg = "🧠", 3447003, "sem remediação automática (ação manual)"
+        elif success:
+            emoji, color, status_msg = "✅", 3066993, "remediação executada com sucesso"
+        else:
+            emoji, color, status_msg = "❌", 15158332, "remediação FALHOU"
+
+        fields = [
+            {"name": "Serviço", "value": ctx.get("service", "?"), "inline": True},
+            {"name": "Severidade", "value": ctx.get("severity", "?"), "inline": True},
+            {"name": "Ação", "value": action, "inline": True},
+        ]
+        if ai_summary:
+            fields.append({
+                "name": "🧠 Análise de causa raiz (IA)",
+                "value": ai_summary[:1024],
+                "inline": False,
+            })
 
         payload = {
             "embeds": [{
-                "title": f"{emoji} Self-Healing: {service}",
-                "description": f"Rollout restart {status_msg}",
+                "title": f"{emoji} Incidente: {ctx.get('alertname', '?')} — {ctx.get('service', '?')}",
+                "description": status_msg,
                 "color": color,
-                "fields": [
-                    {"name": "Serviço", "value": service, "inline": True},
-                    {"name": "Namespace", "value": namespace, "inline": True},
-                    {"name": "Ação", "value": "kubectl rollout restart", "inline": True},
-                ],
-                "footer": {"text": f"SolidaryTech Self-Healing | {details}"},
-                "timestamp": datetime.utcnow().isoformat() + "Z"
+                "fields": fields,
+                "footer": {"text": f"SolidaryTech AIOps | {details}"[:2048]},
+                "timestamp": datetime.utcnow().isoformat() + "Z",
             }]
         }
 
         try:
-            import urllib.request
             req = urllib.request.Request(
                 DISCORD_WEBHOOK_URL,
                 data=json.dumps(payload).encode("utf-8"),
                 headers={
-                "Content-Type": "application/json",
-                "User-Agent": "SolidaryTech-SelfHealing/1.0 (Discord Webhook)",
+                    "Content-Type": "application/json",
+                    "User-Agent": "SolidaryTech-AIOps/1.0 (Discord Webhook)",
                 },
-                method="POST"
+                method="POST",
             )
             urllib.request.urlopen(req, timeout=10)
             log.info("Notificação enviada para o Discord.")
         except Exception as e:
             log.error(f"Falha ao enviar notificação Discord: {e}")
 
-    def execute_rollout_restart(service_name, namespace):
-        """Executa kubectl rollout restart no deployment."""
-        cmd = [
-            "kubectl", "rollout", "restart",
-            f"deployment/{service_name}",
-            "-n", namespace
-        ]
-
-        log.info(f"Executando: {' '.join(cmd)}")
-
-        try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=30
-            )
-
-            if result.returncode == 0:
-                log.info(f"✅ Rollout restart OK: {result.stdout.strip()}")
-                send_discord_notification(service_name, namespace, True, result.stdout.strip())
-                return True
-            else:
-                log.error(f"❌ Rollout restart FALHOU: {result.stderr.strip()}")
-                send_discord_notification(service_name, namespace, False, result.stderr.strip())
-                return False
-        except subprocess.TimeoutExpired:
-            log.error("❌ Timeout ao executar rollout restart")
-            send_discord_notification(service_name, namespace, False, "Timeout")
-            return False
-        except Exception as e:
-            log.error(f"❌ Erro inesperado: {e}")
-            send_discord_notification(service_name, namespace, False, str(e))
-            return False
 
     class AlertHandler(BaseHTTPRequestHandler):
         def do_POST(self):
@@ -134,37 +204,52 @@ data:
             for alert in alerts:
                 status = alert.get("status", "unknown")
                 labels = alert.get("labels", {})
+                annotations = alert.get("annotations", {})
                 service_name = labels.get("service_name", "unknown")
                 self_healing = labels.get("self_healing", "false")
+                alertname = labels.get("alertname", "unknown")
 
-                log.info(f"Alerta: {labels.get('alertname')} | "
-                         f"Serviço: {service_name} | "
-                         f"Status: {status} | "
-                         f"Self-healing: {self_healing}")
+                log.info(f"Alerta: {alertname} | Serviço: {service_name} | "
+                         f"Status: {status} | Self-healing: {self_healing}")
 
-                # Só executa self-healing se:
-                # 1. O alerta está firing (não resolved)
-                # 2. O label self_healing é "true"
-                # 3. O serviço é conhecido
+                # Só age em alertas firing (resolved não precisa de ação)
                 if status != "firing":
                     log.info(f"Alerta resolved para {service_name}, nenhuma ação necessária.")
                     continue
 
-                if self_healing != "true":
-                    log.info(f"Alerta sem label self_healing=true, ignorando.")
-                    continue
+                ctx = {
+                    "alertname": alertname,
+                    "service": service_name,
+                    "severity": labels.get("severity", "?"),
+                    "summary": annotations.get("summary", ""),
+                    "description": annotations.get("description", ""),
+                    "runbook_url": annotations.get("runbook_url", ""),
+                }
 
+                # 1) Remediação automática PRIMEIRO — preserva a latência de ms do
+                #    self-healing. Só roda com self_healing=true + serviço conhecido.
                 namespace = SERVICE_NAMESPACE_MAP.get(service_name)
-                if not namespace:
-                    log.warning(f"Serviço desconhecido: {service_name}")
-                    continue
+                if self_healing == "true" and namespace:
+                    log.info(f"🔄 Iniciando self-healing para {service_name} em {namespace}")
+                    success, details = execute_rollout_restart(service_name, namespace)
+                    action = "kubectl rollout restart"
+                else:
+                    success, details = None, "remediação manual (ver runbook)"
+                    action = "nenhuma (sem self_healing)"
+                    if self_healing == "true" and not namespace:
+                        log.warning(f"Serviço desconhecido: {service_name}")
 
-                log.info(f"🔄 Iniciando self-healing para {service_name} em {namespace}")
-                success = execute_rollout_restart(service_name, namespace)
+                # 2) Análise de causa raiz com GenAI (DEPOIS do restart, não bloqueia)
+                ai_summary = generate_incident_summary(ctx)
+
+                # 3) Notificação única no Discord: remediação + análise GenAI
+                send_discord_notification(ctx, action, success, details, ai_summary)
+
                 results.append({
                     "service": service_name,
                     "namespace": namespace,
-                    "success": success
+                    "remediated": success,
+                    "ai_summary": bool(ai_summary),
                 })
 
             self.send_response(200)
@@ -182,11 +267,13 @@ data:
         def log_message(self, format, *args):
             log.info(f"{self.client_address[0]} - {format % args}")
 
+
     if __name__ == "__main__":
         port = int(os.getenv("PORT", "9095"))
         server = HTTPServer(("0.0.0.0", port), AlertHandler)
-        log.info(f"Self-Healing webhook server rodando na porta {port}")
+        log.info(f"Self-Healing + AIOps webhook server rodando na porta {port}")
         server.serve_forever()
+
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -227,6 +314,19 @@ spec:
                   name: self-healing-secrets
                   key: DISCORD_WEBHOOK_URL
                   optional: true
+            # --- AIOps: resumo de incidentes com GenAI (Claude API) ---
+            # ANTHROPIC_API_KEY vem do Secret self-healing-secrets (External
+            # Secrets -> solidarytech/monitoring). optional: true mantem o
+            # self-healing funcionando mesmo sem a chave (resumo e best-effort).
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: self-healing-secrets
+                  key: ANTHROPIC_API_KEY
+                  optional: true
+            # Modelo configuravel. Haiku = rapido e barato (FinOps).
+            - name: ANTHROPIC_MODEL
+              value: "claude-haiku-4-5-20251001"
           volumeMounts:
             - name: script
               mountPath: /app
