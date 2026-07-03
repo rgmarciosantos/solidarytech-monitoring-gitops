@@ -144,6 +144,43 @@ A ação é um `kubectl rollout restart` no deployment afetado, seguido de uma n
 
 ---
 
+## Disaster Recovery (Velero)
+
+O **Velero** (`apps/20-velero.yaml`, sync-wave 20) implementa a **Opção A** do desafio: backup do estado do cluster para um bucket S3. O Argo CD instala o Velero via Helm e cria **duas** `Schedule`s (uma de hora em hora e uma diária, no padrão avô-pai-filho) — sem `kubectl` manual.
+
+| Item | Valor |
+|---|---|
+| Chart / versão | Helm `vmware-tanzu` · `velero 12.1.0` (Velero `1.18.1`) |
+| Plugin | `velero-plugin-for-aws:v1.14.2` (linha compatível com Velero 1.18.x) |
+| Destino | Bucket `solidarytech-velero-<ACCOUNT_ID>` · `us-east-1` (mesma conta) |
+| Agenda · nível 1 | `hourly-cluster-backup` · `0 * * * *` (de hora em hora) · ttl `72h` (3 dias) → **RPO de topologia ≈ 1h** |
+| Agenda · nível 2 | `daily-cluster-backup` · `0 5 * * *` (05:00 UTC = 02:00 BRT) · ttl `168h` (7 dias) → semana de pontos diários |
+| Escopo | Cluster inteiro (`includedNamespaces: '*'`) |
+
+**O que é (e não é) protegido.** Como o cluster de lab não tem EBS CSI Driver e roda tudo em `emptyDir`, **não há PersistentVolume** para snapshot — por isso `snapshotsEnabled: false`. O backup captura o **estado do cluster** (namespaces, deployments, services, configmaps, secrets, ingress, RBAC, CRs). Os **dados transacionais** das doações continuam protegidos pelo **PITR do RDS/DynamoDB** (RPO ~15 min) — camada separada, como descreve o PCN. O backup roda em **dois níveis**: o **horário** (retenção de 3 dias) garante o RPO da topologia do cluster em **≈ 1h**, exatamente o que o dossiê define para a "Topologia da aplicação" (≈ 1 h, configurável); o **diário** (retenção de 7 dias) mantém uma semana de pontos de restauração sem acumular ~168 backups horários. O RPO de **~15 min dos dados** transacionais é de outra camada (PITR do RDS/DynamoDB) e permanece inalterado.
+
+**CRDs.** Instalados pelo Argo CD a partir da pasta `crds/` do chart (o `helm template` do Argo já roda com `--include-crds`). O job `upgradeCRDs` fica **desligado** para evitar dependência de RBAC/imagem `kubectl` no lab.
+
+**Credenciais.** Via `credentials.existingSecret: velero-aws-credentials` (chave `cloud`, formato INI), criado pelo bootstrap Terraform — ver [Pré-requisitos](#pré-requisitos-uma-vez). O plugin usa `aws-sdk-go-v2`, que lê `aws_session_token` do INI (funciona com as credenciais temporárias do Academy).
+
+**Métricas.** `metrics.serviceMonitor.enabled: true` → o Prometheus faz scrape do Velero, então o sucesso/falha de cada backup aparece no Prometheus/Grafana (evidência do "backup monitorado" do PCN).
+
+**Demonstrar (evidência para a banca):**
+```bash
+# instalar o CLI do velero e apontar para o namespace velero
+velero version
+velero backup-location get                       # default · Available
+velero schedule get                              # hourly-cluster-backup + daily-cluster-backup
+velero backup create demo --from-schedule hourly-cluster-backup   # dispara na hora
+velero backup describe demo --details
+velero backup logs demo
+aws s3 ls "s3://solidarytech-velero-<ACCOUNT_ID>/backups/"        # objetos no bucket
+```
+
+Restauração (num cluster novo/limpo): `velero restore create --from-backup <nome>`.
+
+---
+
 ## Segredos (External Secrets)
 
 Nada de segredo no Git. Um `SecretStore` aponta para o **AWS Secrets Manager** (`us-east-1`) e quatro `ExternalSecret` materializam os Secrets do cluster a partir do segredo `solidarytech/monitoring`:
@@ -166,7 +203,8 @@ solidarytech-monitoring-gitops/
 │   ├── 00-monitoring.yaml               # wave −10: stack de observabilidade
 │   ├── 10-donation-service.yaml         # wave 10 → repo deploy-donation-service
 │   ├── 10-ngo-service.yaml              # wave 10 → repo deploy-ngo-service
-│   └── 10-volunteer-service.yaml        # wave 10 → repo deploy-volunteer-service
+│   ├── 10-volunteer-service.yaml        # wave 10 → repo deploy-volunteer-service
+│   └── 20-velero.yaml                   # wave 20 → Velero (DR): instala + backup horário + diário
 ├── argocd-apps/                         # Applications do stack de observabilidade
 │   ├── 01-kube-prometheus-stack.yaml
 │   ├── 02-loki-stack.yaml
@@ -194,6 +232,27 @@ solidarytech-monitoring-gitops/
    `DISCORD_WEBHOOK_URL`, `PAGERDUTY_SERVICE_KEY`, `GRAFANA_ADMIN_USER`, `GRAFANA_ADMIN_PASSWORD`, `NEW_RELIC_API_KEY`.
 
 3. **Secret `aws-credentials`** no namespace `monitoring` (criado pelo bootstrap Terraform), com `access-key`, `secret-access-key` e `session-token` — é o mesmo que o `SecretStore` e o Loki usam.
+
+4. **Bucket S3 para o Velero (DR)** — na **mesma conta e região** do restante:
+   ```bash
+   ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+   aws s3 mb "s3://solidarytech-velero-$ACCOUNT_ID" --region us-east-1
+
+   # Tags FinOps (o `aws s3 mb` não taggeia sozinho):
+   aws s3api put-bucket-tagging \
+     --bucket "solidarytech-velero-$ACCOUNT_ID" \
+     --tagging 'TagSet=[{Key=Project,Value=SolidaryTech},{Key=Environment,Value=Production},{Key=CostCenter,Value=NGO-Core},{Key=Owner,Value=Plataforma},{Key=ManagedBy,Value=Manual}]'
+   ```
+   Se o ID da sua conta for diferente do placeholder `042702827117`, ajuste o `bucket:` em `apps/20-velero.yaml`.
+
+5. **Secret `velero-aws-credentials`** no namespace `velero`, com a chave `cloud`
+   (arquivo de credenciais AWS em formato INI). É criado pelo **bootstrap Terraform**
+   (bastion) junto com o namespace `velero`. Consumido pelo Velero via
+   `credentials.existingSecret`.
+
+   > **AWS Academy:** essas credenciais são temporárias (`session-token`) e expiram.
+   > Quando expiram, o backup agendado do Velero falha até o Secret ser renovado —
+   > exatamente a mesma limitação do Loki. Em conta real, isso seria IRSA.
 
 -
 ---

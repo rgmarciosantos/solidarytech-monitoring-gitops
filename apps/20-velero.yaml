@@ -1,0 +1,191 @@
+# =============================================================================
+# Sync-wave 20: Disaster Recovery (Velero)
+# =============================================================================
+# Registrada pelo solidarytech-root (varre a pasta apps/). Instala o Velero via
+# Helm e cria uma Schedule que faz backup do estado do cluster 1x/dia — tudo de
+# forma automática, sem kubectl manual.
+#
+# Por que wave 20 (depois dos microsserviços, wave 10):
+#   O Velero é DR, não é pré-requisito dos microsserviços. Deixá-lo na wave 20
+#   garante que ele NUNCA bloqueie a subida do hot-path (donation-service). Se
+#   preferir que o DR suba junto da observabilidade, mude a wave para -5.
+#
+# -----------------------------------------------------------------------------
+# PRÉ-REQUISITOS (uma única vez) — ver README, seção "Pré-requisitos":
+#   1) Bucket S3 na MESMA conta (mesma região, us-east-1):
+#        aws s3 mb s3://solidarytech-velero-$(aws sts get-caller-identity \
+#          --query Account --output text) --region us-east-1
+#      (e aplicar as tags FinOps — comando completo no README)
+#   2) Secret "velero-aws-credentials" no namespace "velero", com a chave
+#      "cloud" no formato INI do AWS. É criado pelo bootstrap Terraform
+#      (bastion) junto com o namespace "velero". Ver infra repo.
+#
+# ATENÇÃO (AWS Academy): as credenciais são temporárias (session-token) e
+# expiram. Quando expiram, o backup agendado falha até o Secret ser renovado
+# (mesma limitação do Loki). Em conta real isso seria resolvido com IRSA.
+# -----------------------------------------------------------------------------
+# Bucket abaixo está fixo em ...-042702827117 (mesmo ID que o manifesto do
+# Loki usa). CONFIRME que é o ID da SUA conta; se for outro, ajuste aqui.
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: velero
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: solidarytech
+    app.kubernetes.io/component: disaster-recovery
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://vmware-tanzu.github.io/helm-charts
+    chart: velero
+    targetRevision: "12.1.0" # Velero appVersion 1.18.1
+    helm:
+      values: |
+        # -----------------------------------------------------------------
+        # Plugin de object storage para AWS S3.
+        # v1.14.x é a linha compatível com o Velero 1.18.x (padrão da matriz
+        # oficial: v1.13.x→1.17.x, v1.12.x→1.16.x ...). O plugin usa
+        # aws-sdk-go-v2, que lê aws_session_token do arquivo de credenciais —
+        # essencial para as credenciais temporárias do AWS Academy.
+        # -----------------------------------------------------------------
+        initContainers:
+          - name: velero-plugin-for-aws
+            image: velero/velero-plugin-for-aws:v1.14.2
+            imagePullPolicy: IfNotPresent
+            volumeMounts:
+              - mountPath: /target
+                name: plugins
+
+        # -----------------------------------------------------------------
+        # Credenciais: usa o Secret pré-existente "velero-aws-credentials"
+        # (chave "cloud", formato INI) criado pelo bootstrap Terraform no
+        # namespace velero. Nada de segredo no Git.
+        # -----------------------------------------------------------------
+        credentials:
+          useSecret: true
+          existingSecret: velero-aws-credentials
+
+        # -----------------------------------------------------------------
+        # CRDs: o ArgoCD instala os CRDs da pasta crds/ do chart (o
+        # `helm template` do ArgoCD já roda com --include-crds por padrão).
+        # Por isso o job upgradeCRDs (que precisaria de RBAC + imagem kubectl)
+        # fica DESLIGADO — evita complexidade e falhas de permissão no lab.
+        # Se por acaso os CRDs não aparecerem, volte upgradeCRDs para true.
+        # -----------------------------------------------------------------
+        upgradeCRDs: false
+        cleanUpCRDs: false
+
+        # -----------------------------------------------------------------
+        # Snapshots de volume DESLIGADOS: o cluster do lab não tem EBS CSI
+        # Driver e roda tudo em emptyDir — não há PersistentVolume para tirar
+        # snapshot. O backup captura o ESTADO do cluster (namespaces,
+        # deployments, services, configmaps, secrets, ingress, RBAC, CRs...).
+        # Node-agent também off (só faria sentido com volumes a copiar).
+        # -----------------------------------------------------------------
+        snapshotsEnabled: false
+        deployNodeAgent: false
+
+        # -----------------------------------------------------------------
+        # BackupStorageLocation → bucket S3 na mesma conta / mesma região.
+        # -----------------------------------------------------------------
+        configuration:
+          backupStorageLocation:
+            - name: default
+              provider: aws
+              bucket: solidarytech-velero-042702827117
+              default: true
+              config:
+                region: us-east-1
+                s3ForcePathStyle: "false"
+
+        # -----------------------------------------------------------------
+        # Métricas: expõe /metrics e cria um ServiceMonitor. O Prometheus do
+        # kube-prometheus-stack já faz scrape de ServiceMonitors em qualquer
+        # namespace, então o sucesso/falha de backup entra no Prometheus/
+        # Grafana (evidência para o "backup monitorado" do PCN).
+        # -----------------------------------------------------------------
+        metrics:
+          enabled: true
+          serviceMonitor:
+            enabled: true
+
+        # -----------------------------------------------------------------
+        # Rightsizing (FinOps): requests/limits enxutos para o servidor.
+        # -----------------------------------------------------------------
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+
+        # -----------------------------------------------------------------
+        # Schedules em DOIS NÍVEIS (padrão avô-pai-filho / GFS):
+        #
+        #  1) hourly-cluster-backup — de hora em hora (minuto 0 de cada hora),
+        #     ttl 72h (3 dias). É o nível que garante o RPO de topologia ≈ 1h
+        #     do dossiê ("Topologia da aplicação ≈ 1 h, configurável").
+        #     Retenção curta = FinOps: backup horário perde valor rápido.
+        #
+        #  2) daily-cluster-backup — 1x/dia às 05:00 UTC (= 02:00 em São Paulo,
+        #     fora do pico), ttl 168h (7 dias). Dá uma semana de pontos de
+        #     restauração diários SEM manter ~168 backups horários vivos.
+        #
+        # Ambos capturam o cluster inteiro (includedNamespaces '*'), sem
+        # snapshot de volume (não há PV: emptyDir). O cron do Velero é sempre
+        # em UTC. Às 05:00 UTC os dois disparam — são objetos independentes,
+        # com nomes e TTLs distintos, então a duplicação é inofensiva.
+        #
+        # O RPO dos DADOS transacionais (15 min) continua vindo do PITR do
+        # RDS/DynamoDB — camadas diferentes, como descrito no PCN.
+        # -----------------------------------------------------------------
+        schedules:
+          hourly-cluster-backup:
+            disabled: false
+            schedule: "0 * * * *"
+            useOwnerReferencesInBackup: false
+            labels:
+              app.kubernetes.io/part-of: solidarytech
+              app.kubernetes.io/component: disaster-recovery
+            template:
+              ttl: "72h0m0s"
+              storageLocation: default
+              snapshotVolumes: false
+              includedNamespaces:
+                - "*"
+          daily-cluster-backup:
+            disabled: false
+            schedule: "0 5 * * *"
+            useOwnerReferencesInBackup: false
+            labels:
+              app.kubernetes.io/part-of: solidarytech
+              app.kubernetes.io/component: disaster-recovery
+            template:
+              ttl: "168h0m0s"
+              storageLocation: default
+              snapshotVolumes: false
+              includedNamespaces:
+                - "*"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: velero
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m
